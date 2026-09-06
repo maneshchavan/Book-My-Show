@@ -1,6 +1,9 @@
 pipeline {
     agent any
-   stage('Check Node and NPM') {
+
+    stages {
+
+        stage('Check Node and NPM') {
             steps {
                 sh '''
                     node -v
