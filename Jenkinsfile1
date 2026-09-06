@@ -1,115 +1,208 @@
 pipeline {
-    agent any
+agent any
 
-    stages {
+```
+environment {
+    DOCKER_IMAGE = 'maneshchavan/bms'
+    IMAGE_TAG = 'latest'
+    NODE_OPTIONS = '--openssl-legacy-provider'
+}
 
-        stage('Check Node and NPM') {
-            steps {
+stages {
+
+    stage('Clean Workspace') {
+        steps {
+            cleanWs()
+        }
+    }
+
+    stage('Checkout from GitHub') {
+        steps {
+            git branch: 'main',
+                url: 'https://github.com/maneshchavan/Book-My-Show.git'
+
+            sh '''
+                echo "Repository files:"
+                ls -la
+            '''
+        }
+    }
+
+    stage('Check Node and NPM') {
+        steps {
+            sh '''
+                echo "Node.js Version:"
+                node -v
+
+                echo "NPM Version:"
+                npm -v
+            '''
+        }
+    }
+
+    stage('Install Dependencies') {
+        steps {
+            dir('bookmyshow-app') {
                 sh '''
-                    node -v
-                    npm -v
+                    if [ ! -f package.json ]; then
+                        echo "ERROR: package.json not found!"
+                        exit 1
+                    fi
+
+                    echo "Installing dependencies..."
+                    npm install
                 '''
             }
         }
-    stages {
-        stage('Clean Workspace') {
-            steps {
-                cleanWs()
-            }
-        }
-        stage('Checkout from Git') {
-            steps {
-                git branch: 'main', url: 'https://github.com/maneshchavan/Book-My-Show.git'
-                sh 'ls -la'  // Verify files after checkout
-            }
-        }
-        stage('SonarQube Analysis') {
-            steps {
-                withSonarQubeEnv('sonar-server') {
-                    sh ''' 
-                    $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=BMS \
-                    -Dsonar.projectKey=BMS 
+    }
+
+    stage('SonarQube Analysis') {
+        steps {
+            withSonarQubeEnv('sonar-server') {
+                dir('bookmyshow-app') {
+                    sh '''
+                        $SCANNER_HOME/bin/sonar-scanner \
+                        -Dsonar.projectName=BMS \
+                        -Dsonar.projectKey=BMS
                     '''
                 }
             }
         }
-        stage('Quality Gate') {
-            steps {
-                script {
-                    waitForQualityGate abortPipeline: false, credentialsId: 'Sonar-token'
-                }
+    }
+
+    stage('Quality Gate') {
+        steps {
+            timeout(time: 10, unit: 'MINUTES') {
+                waitForQualityGate abortPipeline: false
             }
         }
-        stage('Install Dependencies') {
-            steps {
+    }
+
+    stage('Build React Application') {
+        steps {
+            dir('bookmyshow-app') {
                 sh '''
-                cd bookmyshow-app
-                ls -la  # Verify package.json exists
-                if [ -f package.json ]; then
-                    rm -rf node_modules package-lock.json  # Remove old dependencies
-                    npm install  # Install fresh dependencies
-                else
-                    echo "Error: package.json not found in bookmyshow-app!"
-                    exit 1
-                fi
+                    echo "Building React application..."
+                    npm run build
                 '''
             }
         }
-        stage('OWASP FS Scan') {
-            steps {
-                dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP-Check'
-                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
-            }
-        }
-        stage('Trivy FS Scan') {
-            steps {
-                sh 'trivy fs . > trivyfs.txt'
-            }
-        }
-        stage('Docker Build & Push') {
-            steps {
-                script {
-                    withDockerRegistry(credentialsId: 'docker', toolName: 'docker') {
-                        sh ''' 
-                        echo "Building Docker image..."
-                        docker build --no-cache -t kastrov/bms:latest -f bookmyshow-app/Dockerfile bookmyshow-app
+    }
 
-                        echo "Pushing Docker image to registry..."
-                        docker push kastrov/bms:latest
-                        '''
-                    }
+    stage('OWASP Dependency Check') {
+        steps {
+            dependencyCheck(
+                additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit',
+                odcInstallation: 'DP-Check'
+            )
+
+            dependencyCheckPublisher(
+                pattern: '**/dependency-check-report.xml'
+            )
+        }
+    }
+
+    stage('Trivy File System Scan') {
+        steps {
+            sh '''
+                trivy fs \
+                --no-progress \
+                --format table \
+                -o trivyfs.txt \
+                .
+            '''
+        }
+    }
+
+    stage('Docker Build') {
+        steps {
+            sh '''
+                echo "Building Docker image..."
+
+                docker build --no-cache \
+                -t ${DOCKER_IMAGE}:${IMAGE_TAG} \
+                -f bookmyshow-app/Dockerfile \
+                bookmyshow-app
+            '''
+        }
+    }
+
+    stage('Docker Push') {
+        steps {
+            script {
+                withDockerRegistry(
+                    credentialsId: 'docker',
+                    toolName: 'docker'
+                ) {
+                    sh '''
+                        echo "Pushing Docker image..."
+
+                        docker push ${DOCKER_IMAGE}:${IMAGE_TAG}
+                    '''
                 }
             }
         }
-        stage('Deploy to Container') {
-            steps {
-                sh ''' 
-                echo "Stopping and removing old container..."
+    }
+
+    stage('Deploy Container') {
+        steps {
+            sh '''
+                echo "Stopping old container..."
+
                 docker stop bms || true
                 docker rm bms || true
 
-                echo "Running new container on port 3000..."
-                docker run -d --restart=always --name bms -p 3000:3000 maneshchavan/bms:latest
+                echo "Running new container..."
 
-                echo "Checking running containers..."
-                docker ps -a
+                docker run -d \
+                --restart unless-stopped \
+                --name bms \
+                -p 3000:3000 \
+                ${DOCKER_IMAGE}:${IMAGE_TAG}
 
-                echo "Fetching logs..."
-                sleep 5  # Give time for the app to start
+                echo "Waiting for container..."
+                sleep 10
+
+                echo "Running containers:"
+                docker ps
+
+                echo "Application logs:"
                 docker logs bms
-                '''
-            }
+            '''
         }
     }
-    post {
-        always {
-            emailext attachLog: true,
-                subject: "'${currentBuild.result}'",
-                body: "Project: ${env.JOB_NAME}<br/>" +
-                      "Build Number: ${env.BUILD_NUMBER}<br/>" +
-                      "URL: ${env.BUILD_URL}<br/>",
-                to: 'maneshchavan29@gmail.com',
-                attachmentsPattern: 'trivyfs.txt,trivyimage.txt'
-        }
+}
+
+post {
+
+    success {
+        echo 'Pipeline completed successfully!'
     }
- }
+
+    failure {
+        echo 'Pipeline failed. Check the console output.'
+    }
+
+    always {
+        archiveArtifacts artifacts: 'trivyfs.txt', allowEmptyArchive: true
+
+        emailext(
+            attachLog: true,
+            subject: "${currentBuild.currentResult}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+            body: """
+                <h3>Book My Show CI/CD Pipeline</h3>
+
+                <p><b>Project:</b> ${env.JOB_NAME}</p>
+                <p><b>Build Number:</b> ${env.BUILD_NUMBER}</p>
+                <p><b>Status:</b> ${currentBuild.currentResult}</p>
+                <p><b>Build URL:</b> ${env.BUILD_URL}</p>
+            """,
+            to: 'maneshchavan29@gmail.com',
+            attachmentsPattern: 'trivyfs.txt'
+        )
+    }
+}
+```
+
+}
+
