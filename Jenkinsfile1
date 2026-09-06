@@ -1,12 +1,14 @@
 pipeline {
     agent any
-    tools {
-        jdk 'jdk17'
-        nodejs 'node23'
-    }
-    environment {
-        SCANNER_HOME = tool 'sonar-scanner'
-    }
+ 
+    stage('Check Node and NPM') {
+            steps {
+                sh '''
+                    node -v
+                    npm -v
+                '''
+            }
+        }
     stages {
         stage('Clean Workspace') {
             steps {
